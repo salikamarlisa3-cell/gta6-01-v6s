@@ -1,141 +1,99 @@
-// Drawing only: the world's state and the current screen in, pixels out. The 1280x720 playfield
-// is scaled to fit the window and centred, the margin filled with the backdrop colour. Flat
-// rectangles and circles, canvas text for the HUD and the panels. Text that holds a number is
-// rebuilt only when the number changes, so a frame allocates nothing.
-import { FIELD, FONT, LIVES, PALETTE } from './config.js';
-import { KIND_COIN } from './world.js';
+// render.js — the three.js stage and the adaptive quality governor.
+// A 62-degree camera rides behind the player (further back in a car), the
+// sun is a single shadow-casting directional light, and the governor keeps
+// the game playable anywhere: it watches an exponential moving average of
+// frame rate and, when the machine struggles (a software rasteriser like
+// SwiftShader included), steps quality down — pixel ratio first, then
+// shadows, then particle counts — and steps back up when headroom returns.
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_OVER = 'over';
+import { S, clamp, lerp } from './util.js';
 
-/** The panel's width; its height grows with its lines: room for the title, the lines and the prompt. */
-const PANEL = { width: 600, top: 134, line: 34, bottom: 70 };
-const LIFE_SIZE = 20;
-const LIFE_GAP = 8;
+export const R = { renderer: null, scene: null, camera: null, evalT: 0, goodStreak: 0 };
 
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+export function initRender(canvas) {
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x8ec9e8);
+  scene.fog = new THREE.Fog(0xa8c8dd, 130, 520);
+  const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.1, 1500);
+  camera.position.set(0, 8, -14);
+  const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x54503e, 0.7);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xfff2d8, 1.1);
+  sun.position.set(120, 180, 60);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -130; sun.shadow.camera.right = 130;
+  sun.shadow.camera.top = 130; sun.shadow.camera.bottom = -130;
+  sun.shadow.camera.far = 700;
+  sun.shadow.bias = -0.0006;
+  scene.add(sun); scene.add(sun.target);
+  const amb = new THREE.AmbientLight(0xffffff, 0.14);
+  scene.add(amb);
+  R.renderer = renderer; R.scene = scene; R.camera = camera;
+  S.sceneRef = scene;
+  S.sceneRefs = { scene, sun, hemi, camera, renderer };
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+  return R;
 }
 
-export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('Score ');
-  const levelLabel = cachedLabel('Level ');
-  const finalLabel = cachedLabel('Score ');
-  const bestLabel = cachedLabel('Best ');
+function applyQuality(q) {
+  S.quality = q;
+  const r = R.renderer;
+  if (!r) return;
+  const dpr = devicePixelRatio || 1;
+  if (q === 0) { r.setPixelRatio(Math.min(dpr, 2)); r.shadowMap.enabled = true; S.particleMul = 1; }
+  else if (q === 1) { r.setPixelRatio(Math.min(dpr, 1.25)); r.shadowMap.enabled = true; S.particleMul = 0.8; }
+  else if (q === 2) { r.setPixelRatio(1); r.shadowMap.enabled = false; S.particleMul = 0.6; }
+  else { r.setPixelRatio(0.7); r.shadowMap.enabled = false; S.particleMul = 0.4; }
+  if (R.scene) R.scene.traverse(o => { if (o.material) o.material.needsUpdate = true; });
+}
 
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
+export function updateGovernor(dtRaw) {
+  if (dtRaw > 0) S.fpsEMA = lerp(S.fpsEMA, 1 / Math.max(dtRaw, 1e-4), 0.045);
+  R.evalT += dtRaw;
+  if (R.evalT < 2) return;
+  R.evalT = 0;
+  if (S.fpsEMA < 33 && S.quality < 3) { applyQuality(S.quality + 1); R.goodStreak = 0; }
+  else if (S.fpsEMA > 56 && S.quality > 0) {
+    R.goodStreak++;
+    if (R.goodStreak >= 2) { applyQuality(S.quality - 1); R.goodStreak = 0; }
+  } else R.goodStreak = 0;
+}
+
+const _camPos = new THREE.Vector3(0, 8, -14);
+export function updateCamera(dt) {
+  const cam = R.camera, pl = S.playerRef;
+  if (!cam || !pl) return;
+  if (S.shotMode && S.shotCam) {
+    cam.position.set(S.shotCam.x, S.shotCam.y, S.shotCam.z);
+    cam.lookAt(S.shotCam.lx, S.shotCam.ly, S.shotCam.lz);
+    _camPos.copy(cam.position);
+    return;
   }
+  const inVeh = pl.inCar || pl.inBoat;
+  const distWanted = S.camDist * (inVeh ? 1.5 : 1);
+  const fx = Math.sin(S.camYaw), fz = Math.cos(S.camYaw);
+  const tx = pl.x - fx * distWanted;
+  const tz = pl.z - fz * distWanted;
+  const ty = (inVeh ? 2.6 : 2.1) + S.camPitch * 4.4;
+  const k = 1 - Math.exp(-7 * dt);
+  _camPos.x += (tx - _camPos.x) * k;
+  _camPos.y += (ty - _camPos.y) * k;
+  _camPos.z += (tz - _camPos.z) * k;
+  if (_camPos.y < 0.7) _camPos.y = 0.7;
+  cam.position.copy(_camPos);
+  cam.lookAt(pl.x + fx * 7, 1.35 + S.camPitch * 1.2, pl.z + fz * 7);
+}
 
-  const fonts = new Map();
-  function text(value, x, y, size, color, align) {
-    if (!fonts.has(size)) fonts.set(size, `${size}px ${FONT}`);
-    context.font = fonts.get(size);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
-  }
-
-  function drawField(state) {
-    context.fillStyle = PALETTE.sky;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.fillStyle = PALETTE.ground;
-    context.fillRect(0, FIELD.groundY, FIELD.width, FIELD.height - FIELD.groundY);
-
-    const items = state.items;
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      if (item.kind === KIND_COIN) {
-        context.fillStyle = PALETTE.coin;
-        context.beginPath();
-        context.arc(item.x + item.width / 2, item.y + item.height / 2, item.width / 2, 0, Math.PI * 2);
-        context.fill();
-      } else {
-        context.fillStyle = PALETTE.block;
-        context.fillRect(item.x, item.y, item.width, item.height);
-      }
-    }
-
-    const player = state.player;
-    // Blink while invulnerable after a hit: hidden on every other tenth of a second.
-    if (player.invulnerable === 0 || Math.floor(player.invulnerable * 10) % 2 === 1) {
-      context.fillStyle = PALETTE.player;
-      context.fillRect(player.x, player.y, player.width, player.height);
-    }
-  }
-
-  function drawHud(state) {
-    context.textBaseline = 'top';
-    text(scoreLabel(state.score), 24, 20, 28, PALETTE.text, 'left');
-    text(levelLabel(state.level), FIELD.width / 2, 20, 28, PALETTE.text, 'center');
-    const firstLife = FIELD.width - 24 - LIVES * (LIFE_SIZE + LIFE_GAP) + LIFE_GAP;
-    text('Lives', firstLife - 12, 20, 28, PALETTE.text, 'right');
-    for (let life = 0; life < LIVES; life += 1) {
-      context.fillStyle = life < state.lives ? PALETTE.player : PALETTE.ground;
-      context.fillRect(firstLife + life * (LIFE_SIZE + LIFE_GAP), 24, LIFE_SIZE, LIFE_SIZE);
-    }
-  }
-
-  function drawPanel(title, lines, prompt) {
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, PANEL.width, height);
-    context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 78, 48, PALETTE.text, 'center');
-    for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 22, PALETTE.muted, 'center');
-    }
-    text(prompt, FIELD.width / 2, y + height - 40, 24, PALETTE.coin, 'center');
-  }
-
-  const TITLE_LINES = ['Dodge the red blocks. Catch the gold coins.', 'Move with ← → or A D.  Pause with P.', ''];
-  const PAUSED_LINES = ['The blocks will wait for you.'];
-  const OVER_LINES = ['', ''];
-
-  /** Paint one frame: the field, then the HUD or a panel for the screen the game is on. */
-  function draw(state, screen, best) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawField(state);
-    if (screen === SCREEN_TITLE) {
-      TITLE_LINES[2] = bestLabel(best);
-      drawPanel('Block Dodger', TITLE_LINES, 'Press Space or click to start');
-      return;
-    }
-    drawHud(state);
-    if (screen === SCREEN_PAUSED) drawPanel('Paused', PAUSED_LINES, 'Press P to resume');
-    else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      drawPanel('Game over', OVER_LINES, 'Press Space or click to play again');
-    }
-  }
-
-  resize();
-  window.addEventListener('resize', resize);
-  return { draw };
+export function renderFrame() {
+  if (R.renderer) R.renderer.render(R.scene, R.camera);
 }
